@@ -381,3 +381,81 @@ def run_scene(
         }
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
+
+    config = load_config(args.config)
+    if not config["model"].get("use_cot", False):
+        logger.warning(
+            "config['model']['use_cot'] is False -- this checkpoint was not "
+            "trained to produce CoT reasoning, so the concept/prefix/suffix/"
+            "mistake conditions here are unlikely to be meaningful."
+        )
+
+    concepts = [c.strip() for c in args.concepts.split(",") if c.strip()]
+    threshold_words = [int(n) for n in args.threshold_words.split(",") if n.strip()]
+
+    processor = AutoProcessor.from_pretrained(config["model"]["pretrained_model_path"], use_fast=True)
+    dataset = SFTDataset(config["data"]["val"], config["model"], processor)
+
+    model = SFTAutoVLA(config)
+    model.autovla.vlm.resize_token_embeddings(len(processor.tokenizer))
+    state_dict = torch.load(Path(args.checkpoint), map_location=args.device)["state_dict"]
+    model.autovla.load_state_dict(state_dict, strict=False)
+    model.to(args.device)
+    model.autovla.device = args.device
+    model.eval()
+
+    sample_num = len(dataset.scenes)
+    if args.num_samples is not None:
+        sample_num = min(args.num_samples, sample_num)
+    logger.info("Running CoT ablation over %d scenes", sample_num)
+
+    n_success, n_skipped = 0, 0
+    outdir = Path(args.output).resolve().parent
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    with open(args.output, "a") as out_f:
+        for idx in tqdm(range(sample_num), desc="Scenes"):
+            scene_path, _ = dataset.scenes[idx]
+            with open(scene_path, "r") as f:
+                scene_data = json.load(f)
+
+            input_features: Dict[str, Any] = {}
+            for builder in dataset._agent.get_feature_builders():
+                input_features.update(builder.compute_features(scene_data))
+
+            result = run_scene(
+                model, input_features, concepts, threshold_words,
+                args.max_new_tokens, args.seed, args.device,
+            )
+            if result is None:
+                n_skipped += 1
+                continue
+
+            result["scene"] = str(scene_path)
+            out_f.write(json.dumps(result) + "\n")
+            out_f.flush()
+            n_success += 1
+
+            if args.verbose:
+                logger.info(
+                    "[%d/%d] %s  no_cot_ade=%.4f  concept_ade=%.4f",
+                    idx + 1, sample_num, scene_path.name,
+                    result["conditions"].get("no_cot", {}).get("ade_m") or -1.0,
+                    result["conditions"].get("concept_mask", {}).get("ade_m") or -1.0,
+                )
+
+    logger.info("Done: %d succeeded, %d skipped (no action tokens found). Results: %s",
+                n_success, n_skipped, args.output)
+
+
+if __name__ == "__main__":
+    main()
