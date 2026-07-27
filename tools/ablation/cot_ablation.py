@@ -129,3 +129,21 @@ def parse_args():
                          help="Continuation budget for teacher-forced conditions")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Text-editing helpers for each condition
+# ---------------------------------------------------------------------------
+
+def concept_mask(text: str, concepts: List[str]) -> Tuple[str, int]:
+    """Drop any word that starts with one of `concepts` (case-insensitive,
+    so plural/inflected forms like "pedestrians" are also caught)."""
+    concept_list = [c.strip().lower() for c in concepts if c.strip()]
+
+    def is_concept(word: str) -> bool:
+        bare = word.strip(string.punctuation).lower()
+        return any(bare.startswith(c) for c in concept_list if bare)
+
+    words = text.split()
+    kept = [w for w in words if not is_concept(w)]
+    return " ".join(kept), len(words) - len(kept)
