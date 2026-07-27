@@ -147,3 +147,7 @@ def concept_mask(text: str, concepts: List[str]) -> Tuple[str, int]:
     words = text.split()
     kept = [w for w in words if not is_concept(w)]
     return " ".join(kept), len(words) - len(kept)
+
+
+def prefix_truncate(text: str, n: int) -> str:
+    return " ".join(text.split()[:n])
