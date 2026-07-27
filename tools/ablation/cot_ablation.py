@@ -261,3 +261,53 @@ def generate_full(autovla: AutoVLA, input_features: dict, seed: int, device: str
         "reasoning_text": autovla.processor.decode(reasoning_ids).strip(),
         "trajectory": trajectory[0, 1:].numpy(),
     }
+
+
+def continue_from_text(
+    autovla: AutoVLA,
+    prompt_model_inputs: Dict[str, torch.Tensor],
+    edited_text: str,
+    max_new_tokens: int,
+    seed: int,
+) -> Optional[np.ndarray]:
+    """Teacher-force `edited_text` as the assistant's reasoning-so-far by
+    appending its tokens after the prompt, then let the model continue
+    autoregressively (fresh words + action tokens) from there."""
+    if edited_text.strip():
+        edited_ids = autovla.processor.tokenizer(
+            edited_text, add_special_tokens=False, return_tensors="pt"
+        ).input_ids.to(prompt_model_inputs["input_ids"].device)
+    else:
+        edited_ids = torch.empty(
+            (1, 0), dtype=prompt_model_inputs["input_ids"].dtype,
+            device=prompt_model_inputs["input_ids"].device,
+        )
+
+    forced_input_ids = torch.cat([prompt_model_inputs["input_ids"], edited_ids], dim=1)
+    forced_attention_mask = torch.cat(
+        [prompt_model_inputs["attention_mask"], torch.ones_like(edited_ids)], dim=1
+    )
+
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        generated = autovla.vlm.generate(
+            input_ids=forced_input_ids,
+            attention_mask=forced_attention_mask,
+            pixel_values_videos=prompt_model_inputs["pixel_values_videos"],
+            video_grid_thw=prompt_model_inputs["video_grid_thw"],
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=autovla.gen_conf["temperature"],
+            top_k=autovla.gen_conf["top_k"],
+            top_p=autovla.gen_conf["top_p"],
+        )
+
+    continuation = generated[0, forced_input_ids.shape[1]:].cpu()
+    action_ids = continuation[continuation >= autovla.action_start_id]
+    if len(action_ids) == 0:
+        return None
+
+    trajectory = autovla.action_tokenizer.decode_token_ids_to_trajectory(action_ids)
+    if len(trajectory) == 0:
+        return None
+    return trajectory[0, 1:].numpy()
