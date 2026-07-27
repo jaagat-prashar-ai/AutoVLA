@@ -169,3 +169,19 @@ def inject_mistakes(text: str) -> Tuple[str, List[str]]:
 
     edited = _MISTAKE_PATTERN.sub(_sub, text)
     return edited, fired
+
+
+# ---------------------------------------------------------------------------
+# Trajectory metrics
+# ---------------------------------------------------------------------------
+
+def trajectory_deltas(baseline: np.ndarray, other: np.ndarray) -> dict:
+    T = min(len(baseline), len(other))
+    if T == 0:
+        return {"ade_m": None, "endpoint_m": None, "delta_xy_per_waypoint": []}
+    delta_xy = np.linalg.norm(other[:T, :2] - baseline[:T, :2], axis=-1)
+    return {
+        "ade_m": float(delta_xy.mean()),
+        "endpoint_m": float(delta_xy[-1]),
+        "delta_xy_per_waypoint": delta_xy.round(4).tolist(),
+    }
