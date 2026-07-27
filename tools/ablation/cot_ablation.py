@@ -185,3 +185,32 @@ def trajectory_deltas(baseline: np.ndarray, other: np.ndarray) -> dict:
         "endpoint_m": float(delta_xy[-1]),
         "delta_xy_per_waypoint": delta_xy.round(4).tolist(),
     }
+
+
+def _heading_rate(traj: np.ndarray, dt: float) -> np.ndarray:
+    dh = np.diff(traj[:, 2])
+    dh = (dh + np.pi) % (2 * np.pi) - np.pi
+    return dh / dt
+
+
+def _speed(traj: np.ndarray, dt: float) -> np.ndarray:
+    return np.linalg.norm(np.diff(traj[:, :2], axis=0), axis=-1) / dt
+
+
+def control_deltas(baseline: np.ndarray, other: np.ndarray, dt: float) -> dict:
+    if len(baseline) < 2 or len(other) < 2:
+        return {"d_curvature_mean": None, "d_accel_mean": None}
+    hb, ho = _heading_rate(baseline, dt), _heading_rate(other, dt)
+    sb, so = _speed(baseline, dt), _speed(other, dt)
+    Th = min(len(hb), len(ho))
+    d_curv = np.abs(ho[:Th] - hb[:Th]) if Th > 0 else np.array([0.0])
+
+    ab = np.diff(sb) / dt if len(sb) > 1 else np.array([])
+    ao = np.diff(so) / dt if len(so) > 1 else np.array([])
+    Ta = min(len(ab), len(ao))
+    d_accel = np.abs(ao[:Ta] - ab[:Ta]) if Ta > 0 else np.array([0.0])
+
+    return {
+        "d_curvature_mean": float(d_curv.mean()),
+        "d_accel_mean": float(d_accel.mean()),
+    }
