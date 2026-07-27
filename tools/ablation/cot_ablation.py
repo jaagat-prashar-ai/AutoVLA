@@ -214,3 +214,11 @@ def control_deltas(baseline: np.ndarray, other: np.ndarray, dt: float) -> dict:
         "d_curvature_mean": float(d_curv.mean()),
         "d_accel_mean": float(d_accel.mean()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Generation helpers
+# ---------------------------------------------------------------------------
+
+def _to_device(inputs, device: str) -> Dict[str, torch.Tensor]:
+    return {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
