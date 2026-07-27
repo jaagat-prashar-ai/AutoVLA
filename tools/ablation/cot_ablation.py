@@ -151,3 +151,9 @@ def concept_mask(text: str, concepts: List[str]) -> Tuple[str, int]:
 
 def prefix_truncate(text: str, n: int) -> str:
     return " ".join(text.split()[:n])
+
+
+def suffix_truncate(text: str, n: int) -> str:
+    if n <= 0:
+        return ""
+    return " ".join(text.split()[-n:])
