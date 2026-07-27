@@ -157,3 +157,15 @@ def suffix_truncate(text: str, n: int) -> str:
     if n <= 0:
         return ""
     return " ".join(text.split()[-n:])
+
+
+def inject_mistakes(text: str) -> Tuple[str, List[str]]:
+    fired: List[str] = []
+
+    def _sub(m: "re.Match") -> str:
+        key = m.group(0).lower()
+        fired.append(key)
+        return MISTAKE_SWAPS[key]
+
+    edited = _MISTAKE_PATTERN.sub(_sub, text)
+    return edited, fired
