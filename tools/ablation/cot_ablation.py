@@ -222,3 +222,42 @@ def control_deltas(baseline: np.ndarray, other: np.ndarray, dt: float) -> dict:
 
 def _to_device(inputs, device: str) -> Dict[str, torch.Tensor]:
     return {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+
+
+def generate_full(autovla: AutoVLA, input_features: dict, seed: int, device: str) -> Optional[dict]:
+    """Full from-scratch generation (prompt -> reasoning text + action tokens),
+    following the same call pattern as AutoVLA.predict(), but also returning the
+    raw reasoning/action token split so callers can edit the reasoning span."""
+    prompt_inputs = autovla.get_prompt(input_features)
+    model_inputs = _to_device(prompt_inputs, device)
+
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        generated = autovla.vlm.generate(
+            **model_inputs,
+            max_length=autovla.gen_conf["max_length"],
+            do_sample=True,
+            temperature=autovla.gen_conf["temperature"],
+            top_k=autovla.gen_conf["top_k"],
+            top_p=autovla.gen_conf["top_p"],
+        )
+
+    prompt_len = model_inputs["input_ids"].shape[1]
+    completion = generated[0, prompt_len:][:-1].cpu()  # drop trailing eos, mirrors AutoVLA.predict()
+
+    action_mask = completion >= autovla.action_start_id
+    if not action_mask.any():
+        return None
+    action_start_idx = int(action_mask.nonzero()[0].item())
+    reasoning_ids = completion[:action_start_idx]
+    action_ids = completion[action_start_idx:]
+
+    trajectory = autovla.action_tokenizer.decode_token_ids_to_trajectory(action_ids)
+    if len(trajectory) == 0:
+        return None
+
+    return {
+        "model_inputs": model_inputs,
+        "reasoning_text": autovla.processor.decode(reasoning_ids).strip(),
+        "trajectory": trajectory[0, 1:].numpy(),
+    }
