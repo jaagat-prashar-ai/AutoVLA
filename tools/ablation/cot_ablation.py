@@ -311,3 +311,73 @@ def continue_from_text(
     if len(trajectory) == 0:
         return None
     return trajectory[0, 1:].numpy()
+
+
+# ---------------------------------------------------------------------------
+# Per-scene driver
+# ---------------------------------------------------------------------------
+
+def run_scene(
+    model: SFTAutoVLA,
+    input_features: dict,
+    concepts: List[str],
+    threshold_words: List[int],
+    max_new_tokens: int,
+    seed: int,
+    device: str,
+) -> Optional[dict]:
+    autovla = model.autovla
+    dt = model.cfg["model"]["trajectory"]["interval_length"]
+
+    baseline = generate_full(autovla, input_features, seed, device)
+    if baseline is None:
+        return None
+
+    result: Dict[str, Any] = {
+        "cot": baseline["reasoning_text"],
+        "n_words_total": len(baseline["reasoning_text"].split()),
+        "traj_baseline_xy": baseline["trajectory"][:, :2].round(4).tolist(),
+        "conditions": {},
+    }
+
+    # no_cot: full independent regeneration with use_cot toggled off (experiment A)
+    autovla.use_cot = False
+    no_cot = generate_full(autovla, input_features, seed, device)
+    autovla.use_cot = True
+    if no_cot is not None:
+        result["conditions"]["no_cot"] = {
+            **trajectory_deltas(baseline["trajectory"], no_cot["trajectory"]),
+            **control_deltas(baseline["trajectory"], no_cot["trajectory"], dt),
+        }
+
+    reasoning_text = baseline["reasoning_text"]
+    prompt_model_inputs = baseline["model_inputs"]
+
+    conditions_to_run: List[Tuple[str, str, dict]] = []
+
+    edited, n_masked = concept_mask(reasoning_text, concepts)
+    conditions_to_run.append(("concept_mask", edited, {"concepts": concepts, "n_words_masked": n_masked}))
+
+    for n in sorted(threshold_words):
+        conditions_to_run.append((f"prefix_{n}w", prefix_truncate(reasoning_text, n), {"n": n}))
+        conditions_to_run.append((f"suffix_{n}w", suffix_truncate(reasoning_text, n), {"n": n}))
+
+    mistake_text, fired = inject_mistakes(reasoning_text)
+    if fired:
+        conditions_to_run.append(("injected_mistake", mistake_text, {"rules_fired": fired}))
+    else:
+        result["injected_mistake_skipped"] = "no mistake-substitution rule matched this scene's reasoning text"
+
+    for name, edited_text, meta in conditions_to_run:
+        traj = continue_from_text(autovla, prompt_model_inputs, edited_text, max_new_tokens, seed)
+        if traj is None:
+            result["conditions"][name] = {**meta, "failed": True}
+            continue
+        result["conditions"][name] = {
+            **meta,
+            "edited_text": edited_text,
+            **trajectory_deltas(baseline["trajectory"], traj),
+            **control_deltas(baseline["trajectory"], traj, dt),
+        }
+
+    return result
