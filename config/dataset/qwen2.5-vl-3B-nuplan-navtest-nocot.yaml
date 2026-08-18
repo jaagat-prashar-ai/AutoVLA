@@ -1,0 +1,14 @@
+name: qwen2.5-vl-3B-nuplan-navtest-nocot
+description: Preprocessing dataset for AutoVLA (No-CoT) on the full navtest split, reusing ishaan.rawal's NFS-mirrored nuPlan/navsim data
+
+# model (only used to load the AutoProcessor/tokenizer, no CoT inference is run)
+pretrained_model_path: /media/training_data/jaagat-prashar/navsim_autovla_eval/models/Qwen2.5-VL-3B-Instruct
+
+# training
+batch_size: 1
+num_workers: 32
+
+# dataset (the split should match the dataset path)
+dataset_name: nuplan
+dataset_path: /media/training_data/ishaan.rawal/navsim/dataset/placeholder/test
+scene_filter: ./navsim/navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml
