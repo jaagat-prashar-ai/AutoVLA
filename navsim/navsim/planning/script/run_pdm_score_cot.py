@@ -89,18 +89,19 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
             else:
                 trajectory, cot_results = agent.compute_trajectory(agent_input)
 
-            # scene = scene_loader.get_scene_from_token(token)
-            # frame_idx = scene.scene_metadata.num_history_frames - 1
-            # fig, _ = plot_cameras_frame_with_bev_agent_cot(scene, frame_idx, agent_trajectory=trajectory, cot=cot_results)
-            # vis_dir = Path(cfg.output_dir) / "Visualization"
-            # vis_dir.mkdir(parents=True, exist_ok=True)
-            # vis_path = vis_dir / f"{token}_bevagent.png"
-            # fig.savefig(vis_path, bbox_inches="tight")
-            # plt.close(fig)
-            # if cot_results:
-            #     cot_md_path = vis_dir / f"{token}_cot.md"
-            #     with open(cot_md_path, "w", encoding="utf-8") as f:
-            #         f.write(cot_results.strip() + "\n")
+            if cfg.get("save_visualization", False):
+                scene = scene_loader.get_scene_from_token(token)
+                frame_idx = scene.scene_metadata.num_history_frames - 1
+                fig, _ = plot_cameras_frame_with_bev_agent_cot(scene, frame_idx, agent_trajectory=trajectory, cot=cot_results)
+                vis_dir = Path(cfg.output_dir) / "Visualization"
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                vis_path = vis_dir / f"{token}_bevagent.png"
+                fig.savefig(vis_path, bbox_inches="tight")
+                plt.close(fig)
+                if cot_results:
+                    cot_md_path = vis_dir / f"{token}_cot.md"
+                    with open(cot_md_path, "w", encoding="utf-8") as f:
+                        f.write(cot_results.strip() + "\n")
 
             pdm_result = pdm_score(
                 metric_cache=metric_cache,
