@@ -192,6 +192,21 @@ def ensure_local(path: str, dataroot: str, s3_bucket: str, s3_prefix: str) -> st
     return path
 
 
+# NuScenes.__init__ (nuscenes/nuscenes.py) auto-loads lidar segmentation
+# label files whenever lidarseg.json/panoptic.json are present and non-empty
+# in the metadata dir -- it then expects a SEPARATE lidarseg/<version>/ and
+# panoptic/<version>/ directory tree of .bin label files, which we don't
+# fetch (irrelevant to trajectory/camera-based generation) and don't want to
+# (huge). Confirmed via a real cluster run's
+# "FileNotFoundError: .../nuscenes/lidarseg/v1.0-trainval". Excluding these
+# two files from the sync keeps that code path from ever triggering.
+# image_annotations.json (~1.1GB) is also conditionally auto-loaded
+# (nuscenes.py:113-115) but never read by anything in this script (we only
+# use nusc.sample/scene/ego_pose/sample_data) -- skipped purely to avoid a
+# multi-minute JSON parse x 4 parallel worker processes for nothing.
+_METADATA_FILES_TO_SKIP = {"lidarseg.json", "panoptic.json", "image_annotations.json"}
+
+
 def ensure_metadata_tables(dataroot: str, version: str, s3_bucket: str, s3_prefix: str) -> None:
     """Download the (few-GB) v1.0-trainval metadata JSON tables NuScenes()
     needs to build its index, if they aren't already present locally."""
@@ -205,6 +220,8 @@ def ensure_metadata_tables(dataroot: str, version: str, s3_bucket: str, s3_prefi
     n = 0
     for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
+            if os.path.basename(obj["Key"]) in _METADATA_FILES_TO_SKIP:
+                continue
             key = obj["Key"]
             local_path = os.path.join(dataroot, key[len(s3_prefix.rstrip("/")) + 1:])
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
