@@ -10,7 +10,8 @@ class CoTAnnotationModel():
                         model_path,
                         torch_dtype=torch.float16,
                         attn_implementation="flash_attention_2",
-                        device_map="auto"
+                        device_map="auto",
+                        max_memory=config.get("max_memory")
                     )
         self.processor = AutoProcessor.from_pretrained(model_path)
 
