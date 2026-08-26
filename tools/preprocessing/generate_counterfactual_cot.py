@@ -207,9 +207,10 @@ def ensure_local(path: str, dataroot: str, s3_bucket: str, s3_prefix: str) -> st
 _METADATA_FILES_TO_SKIP = {"lidarseg.json", "panoptic.json", "image_annotations.json"}
 
 
-def _sync_s3_prefix(local_dir: str, dataroot: str, s3_bucket: str, s3_key_prefix: str, skip_basenames=frozenset()) -> int:
+def _sync_s3_prefix(local_dir: str, s3_bucket: str, s3_key_prefix: str, skip_basenames=frozenset()) -> int:
     """Download every object under s3://s3_bucket/s3_key_prefix/ into
-    dataroot, mirroring the S3 key structure relative to s3_key_prefix."""
+    local_dir, mirroring the S3 key structure relative to s3_key_prefix (i.e.
+    local_dir IS the local mirror root of that prefix, not some ancestor of it)."""
     os.makedirs(local_dir, exist_ok=True)
     s3 = _s3_client()
     prefix = f"{s3_key_prefix.rstrip('/')}/"
@@ -220,7 +221,7 @@ def _sync_s3_prefix(local_dir: str, dataroot: str, s3_bucket: str, s3_key_prefix
             if os.path.basename(obj["Key"]) in skip_basenames:
                 continue
             key = obj["Key"]
-            local_path = os.path.join(dataroot, key[len(prefix):])
+            local_path = os.path.join(local_dir, key[len(prefix):])
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             s3.download_file(s3_bucket, key, local_path)
             n += 1
@@ -234,7 +235,7 @@ def ensure_metadata_tables(dataroot: str, version: str, s3_bucket: str, s3_prefi
     if os.path.isdir(local_version_dir) and os.listdir(local_version_dir):
         return
     n = _sync_s3_prefix(
-        local_version_dir, dataroot, s3_bucket, f"{s3_prefix.rstrip('/')}/{version}",
+        local_version_dir, s3_bucket, f"{s3_prefix.rstrip('/')}/{version}",
         skip_basenames=_METADATA_FILES_TO_SKIP,
     )
     logger.info("Downloaded %d metadata files from s3://%s/%s/%s to %s", n, s3_bucket, s3_prefix, version, local_version_dir)
@@ -249,7 +250,7 @@ def ensure_maps(dataroot: str, s3_bucket: str, s3_prefix: str) -> None:
     local_maps_dir = os.path.join(dataroot, "maps")
     if os.path.isdir(local_maps_dir) and os.listdir(local_maps_dir):
         return
-    n = _sync_s3_prefix(local_maps_dir, dataroot, s3_bucket, f"{s3_prefix.rstrip('/')}/maps")
+    n = _sync_s3_prefix(local_maps_dir, s3_bucket, f"{s3_prefix.rstrip('/')}/maps")
     logger.info("Downloaded %d map files from s3://%s/%s/maps to %s", n, s3_bucket, s3_prefix, local_maps_dir)
 
 
