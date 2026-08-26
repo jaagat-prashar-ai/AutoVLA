@@ -207,27 +207,50 @@ def ensure_local(path: str, dataroot: str, s3_bucket: str, s3_prefix: str) -> st
 _METADATA_FILES_TO_SKIP = {"lidarseg.json", "panoptic.json", "image_annotations.json"}
 
 
+def _sync_s3_prefix(local_dir: str, dataroot: str, s3_bucket: str, s3_key_prefix: str, skip_basenames=frozenset()) -> int:
+    """Download every object under s3://s3_bucket/s3_key_prefix/ into
+    dataroot, mirroring the S3 key structure relative to s3_key_prefix."""
+    os.makedirs(local_dir, exist_ok=True)
+    s3 = _s3_client()
+    prefix = f"{s3_key_prefix.rstrip('/')}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    n = 0
+    for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if os.path.basename(obj["Key"]) in skip_basenames:
+                continue
+            key = obj["Key"]
+            local_path = os.path.join(dataroot, key[len(prefix):])
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            s3.download_file(s3_bucket, key, local_path)
+            n += 1
+    return n
+
+
 def ensure_metadata_tables(dataroot: str, version: str, s3_bucket: str, s3_prefix: str) -> None:
     """Download the (few-GB) v1.0-trainval metadata JSON tables NuScenes()
     needs to build its index, if they aren't already present locally."""
     local_version_dir = os.path.join(dataroot, version)
     if os.path.isdir(local_version_dir) and os.listdir(local_version_dir):
         return
-    os.makedirs(local_version_dir, exist_ok=True)
-    s3 = _s3_client()
-    prefix = f"{s3_prefix.rstrip('/')}/{version}/"
-    paginator = s3.get_paginator("list_objects_v2")
-    n = 0
-    for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if os.path.basename(obj["Key"]) in _METADATA_FILES_TO_SKIP:
-                continue
-            key = obj["Key"]
-            local_path = os.path.join(dataroot, key[len(s3_prefix.rstrip("/")) + 1:])
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            s3.download_file(s3_bucket, key, local_path)
-            n += 1
-    logger.info("Downloaded %d metadata files from s3://%s/%s to %s", n, s3_bucket, prefix, local_version_dir)
+    n = _sync_s3_prefix(
+        local_version_dir, dataroot, s3_bucket, f"{s3_prefix.rstrip('/')}/{version}",
+        skip_basenames=_METADATA_FILES_TO_SKIP,
+    )
+    logger.info("Downloaded %d metadata files from s3://%s/%s/%s to %s", n, s3_bucket, s3_prefix, version, local_version_dir)
+
+
+def ensure_maps(dataroot: str, s3_bucket: str, s3_prefix: str) -> None:
+    """Download nuScenes' maps/ directory (small, ~500MB total) --
+    NuScenes.__init__ EAGERLY initializes a MapMask object per map record
+    (nuscenes.py:117, not lazy like lidarseg/panoptic), asserting each map's
+    PNG mask file exists on disk. Confirmed via a real cluster run's
+    "AssertionError: map mask .../maps/<hash>.png does not exist"."""
+    local_maps_dir = os.path.join(dataroot, "maps")
+    if os.path.isdir(local_maps_dir) and os.listdir(local_maps_dir):
+        return
+    n = _sync_s3_prefix(local_maps_dir, dataroot, s3_bucket, f"{s3_prefix.rstrip('/')}/maps")
+    logger.info("Downloaded %d map files from s3://%s/%s/maps to %s", n, s3_bucket, s3_prefix, local_maps_dir)
 
 
 def load_scene_geometry(
@@ -431,6 +454,7 @@ def main():
 
     logger.info("Ensuring nuScenes metadata tables are local (%s, %s)", args.nuscenes_path, args.nuscenes_version)
     ensure_metadata_tables(args.nuscenes_path, args.nuscenes_version, args.nuscenes_s3_bucket, args.nuscenes_s3_prefix)
+    ensure_maps(args.nuscenes_path, args.nuscenes_s3_bucket, args.nuscenes_s3_prefix)
 
     logger.info("Loading nuScenes (%s, %s)", args.nuscenes_path, args.nuscenes_version)
     nusc = NuScenes(version=args.nuscenes_version, dataroot=args.nuscenes_path, verbose=args.verbose)
