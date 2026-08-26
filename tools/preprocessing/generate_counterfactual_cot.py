@@ -206,11 +206,28 @@ def ensure_local(path: str, dataroot: str, s3_bucket: str, s3_prefix: str) -> st
 # multi-minute JSON parse x 4 parallel worker processes for nothing.
 _METADATA_FILES_TO_SKIP = {"lidarseg.json", "panoptic.json", "image_annotations.json"}
 
+# Exactly the JSON tables NuScenes.__init__ loads for a plain (no lidarseg/
+# panoptic) index build -- what "the metadata is complete" actually means.
+# "Directory exists and is non-empty" is NOT a completeness check: the job is
+# preemptible with requeue, and a mid-sync preemption leaves a partial dir
+# that a non-emptiness check would then treat as done forever after (the
+# autovla-counterfactual-pilot-hf979a failure mode, one directory-layout bug
+# removed).
+_REQUIRED_METADATA_TABLES = (
+    "category", "attribute", "visibility", "instance", "sensor",
+    "calibrated_sensor", "ego_pose", "log", "scene", "sample",
+    "sample_data", "sample_annotation", "map",
+)
+
 
 def _sync_s3_prefix(local_dir: str, s3_bucket: str, s3_key_prefix: str, skip_basenames=frozenset()) -> int:
     """Download every object under s3://s3_bucket/s3_key_prefix/ into
     local_dir, mirroring the S3 key structure relative to s3_key_prefix (i.e.
-    local_dir IS the local mirror root of that prefix, not some ancestor of it)."""
+    local_dir IS the local mirror root of that prefix, not some ancestor of it).
+    Idempotent per file: anything already present with the listed size is kept
+    (boto3's download_file writes to a temp name and renames on completion, so
+    a file existing at its final path with the right size means it finished),
+    letting a requeued run resume a preempted sync instead of redoing it."""
     os.makedirs(local_dir, exist_ok=True)
     s3 = _s3_client()
     prefix = f"{s3_key_prefix.rstrip('/')}/"
@@ -222,17 +239,38 @@ def _sync_s3_prefix(local_dir: str, s3_bucket: str, s3_key_prefix: str, skip_bas
                 continue
             key = obj["Key"]
             local_path = os.path.join(local_dir, key[len(prefix):])
+            if os.path.exists(local_path) and os.path.getsize(local_path) == obj["Size"]:
+                continue
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             s3.download_file(s3_bucket, key, local_path)
             n += 1
     return n
 
 
+def _purge_unservable_label_tables(dataroot: str, version: str) -> None:
+    """Delete stale lidarseg.json/panoptic.json left in a rank workdir by a
+    sync from before _METADATA_FILES_TO_SKIP existed: their presence makes
+    NuScenes.__init__ auto-load those tables and then crash on the missing
+    lidarseg/<version>/ (resp. panoptic/<version>/) label directories -- the
+    original FileNotFoundError the skip list was added for, which stale node
+    state would otherwise resurrect forever. Guarded by the label dir being
+    absent, so on grizzly's NFS mount (which has real lidarseg/ and panoptic/
+    label trees, verified) this never touches anything."""
+    for table in ("lidarseg", "panoptic"):
+        table_json = os.path.join(dataroot, version, f"{table}.json")
+        if os.path.exists(table_json) and not os.path.isdir(os.path.join(dataroot, table, version)):
+            os.remove(table_json)
+            logger.info("Removed stale %s (no %s/%s label dir to serve it)", table_json, table, version)
+
+
 def ensure_metadata_tables(dataroot: str, version: str, s3_bucket: str, s3_prefix: str) -> None:
     """Download the (few-GB) v1.0-trainval metadata JSON tables NuScenes()
-    needs to build its index, if they aren't already present locally."""
+    needs to build its index, unless every required table is already present
+    locally (true on grizzly's NFS mount, which must never be written to --
+    the all-present early return is what keeps this a no-op there)."""
     local_version_dir = os.path.join(dataroot, version)
-    if os.path.isdir(local_version_dir) and os.listdir(local_version_dir):
+    _purge_unservable_label_tables(dataroot, version)
+    if all(os.path.exists(os.path.join(local_version_dir, f"{t}.json")) for t in _REQUIRED_METADATA_TABLES):
         return
     n = _sync_s3_prefix(
         local_version_dir, s3_bucket, f"{s3_prefix.rstrip('/')}/{version}",
@@ -241,17 +279,21 @@ def ensure_metadata_tables(dataroot: str, version: str, s3_bucket: str, s3_prefi
     logger.info("Downloaded %d metadata files from s3://%s/%s/%s to %s", n, s3_bucket, s3_prefix, version, local_version_dir)
 
 
-def ensure_maps(dataroot: str, s3_bucket: str, s3_prefix: str) -> None:
+def ensure_maps(dataroot: str, version: str, s3_bucket: str, s3_prefix: str) -> None:
     """Download nuScenes' maps/ directory (small, ~500MB total) --
     NuScenes.__init__ EAGERLY initializes a MapMask object per map record
     (nuscenes.py:117, not lazy like lidarseg/panoptic), asserting each map's
     PNG mask file exists on disk. Confirmed via a real cluster run's
-    "AssertionError: map mask .../maps/<hash>.png does not exist"."""
-    local_maps_dir = os.path.join(dataroot, "maps")
-    if os.path.isdir(local_maps_dir) and os.listdir(local_maps_dir):
+    "AssertionError: map mask .../maps/<hash>.png does not exist".
+    Completeness = every mask file map.json references exists (map.json is in
+    the metadata dir, which ensure_metadata_tables has already ensured) --
+    same partial-dir rationale as _REQUIRED_METADATA_TABLES."""
+    with open(os.path.join(dataroot, version, "map.json")) as f:
+        mask_files = [record["filename"] for record in json.load(f)]
+    if all(os.path.exists(os.path.join(dataroot, rel)) for rel in mask_files):
         return
-    n = _sync_s3_prefix(local_maps_dir, s3_bucket, f"{s3_prefix.rstrip('/')}/maps")
-    logger.info("Downloaded %d map files from s3://%s/%s/maps to %s", n, s3_bucket, s3_prefix, local_maps_dir)
+    n = _sync_s3_prefix(os.path.join(dataroot, "maps"), s3_bucket, f"{s3_prefix.rstrip('/')}/maps")
+    logger.info("Downloaded %d map files from s3://%s/%s/maps to %s", n, s3_bucket, s3_prefix, os.path.join(dataroot, "maps"))
 
 
 def load_scene_geometry(
@@ -376,8 +418,12 @@ def load_sft_model(
     model = SFTAutoVLA(config)
     model.autovla.vlm.resize_token_embeddings(len(processor.tokenizer))
     checkpoint_path = checkpoint_override or config["model"]["sft_model_path"]
-    state_dict = torch.load(Path(checkpoint_path), map_location=device)["state_dict"]
+    # map_location must be CPU: the model is still CPU-resident here, and on a
+    # cluster worker cuda:0 already holds its half of the 72B labeler --
+    # materializing this 16GB fp32 checkpoint there OOMs deterministically.
+    state_dict = torch.load(Path(checkpoint_path), map_location="cpu")["state_dict"]
     model.autovla.load_state_dict(state_dict, strict=False)
+    del state_dict
     model.to(device)
     model.autovla.device = device
     model.eval()
@@ -401,15 +447,25 @@ def iter_pilot_scenes(
     available = {s["name"]: s["token"] for s in nusc.scene}
     train_scene_tokens = {available[n] for n in train_scene_names if n in available}
 
+    # One K-group per SCENE (the first qualifying sample of each), sharded by
+    # scene token -- not one per sample. nusc.sample is scene-grouped, so
+    # per-sample iteration capped at num_scenes yields consecutive 0.5s-apart
+    # keyframes from only the first ~num_scenes/40 scenes: near-duplicate
+    # K-groups sharing 3 of 4 history frames, ~30x less scene diversity than
+    # the count suggests -- exactly the style/content confound this pilot's
+    # docstring is at pains to avoid.
     yielded = 0
+    done_scenes: set = set()
     for sample in nusc.sample:
-        if sample["scene_token"] not in train_scene_tokens:
+        scene_token = sample["scene_token"]
+        if scene_token not in train_scene_tokens or scene_token in done_scenes:
             continue
-        if _scene_owner(sample["token"], world_size) != rank:
+        if _scene_owner(scene_token, world_size) != rank:
             continue
         geometry = load_scene_geometry(nusc, sample, dataroot, s3_bucket, s3_image_prefix)
         if geometry is None:
             continue
+        done_scenes.add(scene_token)
         yield geometry
         yielded += 1
         if yielded >= num_scenes:
@@ -455,13 +511,29 @@ def main():
 
     logger.info("Ensuring nuScenes metadata tables are local (%s, %s)", args.nuscenes_path, args.nuscenes_version)
     ensure_metadata_tables(args.nuscenes_path, args.nuscenes_version, args.nuscenes_s3_bucket, args.nuscenes_s3_prefix)
-    ensure_maps(args.nuscenes_path, args.nuscenes_s3_bucket, args.nuscenes_s3_prefix)
+    ensure_maps(args.nuscenes_path, args.nuscenes_version, args.nuscenes_s3_bucket, args.nuscenes_s3_prefix)
 
     logger.info("Loading nuScenes (%s, %s)", args.nuscenes_path, args.nuscenes_version)
     nusc = NuScenes(version=args.nuscenes_version, dataroot=args.nuscenes_path, verbose=args.verbose)
 
     logger.info("Loading Qwen2.5-VL-72B labeler from %s", args.vlm_model_path)
-    cot_model = CoTAnnotationModel({"pretrained_model_path": args.vlm_model_path})
+    cot_config: Dict[str, Any] = {"pretrained_model_path": args.vlm_model_path}
+    if torch.cuda.device_count() > 1:
+        # Reserve headroom on the GPU that must ALSO hold the SFT model and
+        # both models' generation transients: accelerate's balanced auto-split
+        # of the ~137GiB fp16 72B across 2x A100-80GB otherwise leaves cuda:0
+        # only ~10GiB free -- too tight once the SFT model (+KV/vision
+        # activations) lands there. Capping GPU0 pushes ~7GiB of 72B layers
+        # onto the other GPU(s), whose caps still leave room for their share
+        # of generation KV.
+        gib = 1024 ** 3
+        max_memory = {
+            i: torch.cuda.get_device_properties(i).total_memory - int(1.5 * gib)
+            for i in range(torch.cuda.device_count())
+        }
+        max_memory[0] = torch.cuda.get_device_properties(0).total_memory - 18 * gib
+        cot_config["max_memory"] = max_memory
+    cot_model = CoTAnnotationModel(cot_config)
 
     logger.info("Loading AutoVLA SFT checkpoint via %s", args.sft_config)
     sft_model, sft_processor = load_sft_model(args.sft_config, args.device, args.sft_checkpoint_override)
@@ -474,7 +546,17 @@ def main():
     ):
         out_path = outdir / f"{scene['token']}.json"
         if out_path.exists():
-            continue
+            # A preemption can truncate a non-atomically-written file from an
+            # OLD run of this script (writes are atomic below, but stale rank
+            # dirs may predate that) -- validate before trusting the skip,
+            # since run.py uploads every *.json here to the training corpus.
+            try:
+                with open(out_path) as f:
+                    json.load(f)
+                continue
+            except (json.JSONDecodeError, OSError):
+                logger.warning("Regenerating %s: existing file is truncated/corrupt", out_path)
+                out_path.unlink()
 
         try:
             gt_lateral, gt_longitudinal = parse_gt_hint(scene["gt_meta_action"])
@@ -512,8 +594,14 @@ def main():
         result = dict(scene)
         result["cot_output"] = real_cot
         result["counterfactuals"] = counterfactuals
-        with open(out_path, "w") as f:
+        # Atomic write (same rationale as boto3's download temp+rename): on
+        # this preemptible job a SIGKILL mid-dump must not leave a truncated
+        # .json that the resume skip would keep and run.py would upload. The
+        # .tmp suffix also keeps it out of run.py's *.json upload glob.
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        with open(tmp_path, "w") as f:
             json.dump(result, f, indent=2)
+        os.replace(tmp_path, out_path)
         n_written += 1
 
         if args.verbose:
