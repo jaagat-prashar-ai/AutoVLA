@@ -11,6 +11,7 @@ from torch.distributed.fsdp import StateDictType
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 from models.action_tokenizer import ActionTokenizer
+from models.coupling_utils import action_token_kl, coupling_step_active
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from models.utils.score import PDM_Reward, TrajectorySampling, Trajectory
 
@@ -326,11 +327,21 @@ class SFTAutoVLA(pl.LightningModule):
         self._train_vision_backbone = config['model']['train_vision_backbone']
         self._train_llm_backbone = config['model']['train_lm_backbone']
 
+        tcfg = config['training']
+        self.vision_coupling_weight = float(tcfg.get('vision_coupling_weight', 0.0))
+        self.vision_coupling_prob = float(tcfg.get('vision_coupling_prob', 0.25))
+        self.vision_coupling_blind = str(tcfg.get('vision_coupling_blind', 'zero'))
+        self.vision_coupling_detach = str(tcfg.get('vision_coupling_detach', 'blind'))
+        self.vision_coupling_warmup_steps = int(tcfg.get('vision_coupling_warmup_steps', 0))
+        self._vc_step = -1
+        self._vc_prev_pixels = None
+        self._vc_prev_grid = None
+
     def training_step(self, batch):
         hascot = batch['has_cot']
         gt_trajectory = batch["gt_trajectory"]
         gt_action = batch["gt_action"]
-        output = self.autovla(batch)
+        output = self.autovla(dict(batch))  # forward pops keys in place; keep batch intact
         loss = output.loss
 
         # === Add additional loss on action tokens ===
@@ -359,6 +370,43 @@ class SFTAutoVLA(pl.LightningModule):
             # print("add more penalty for CoT reasoning data")
             loss = loss * 40
             loss = loss + action_loss
+
+        # camera-blind coupling: KL(p_sighted || q_blind) over action tokens
+        if self.vision_coupling_weight > 0.0:
+            self._vc_step += 1
+            if coupling_step_active(self._vc_step, self.vision_coupling_prob):
+                pv = batch['pixel_values_videos']
+                if self.vision_coupling_blind == 'prev':
+                    buf, grid = self._vc_prev_pixels, self._vc_prev_grid
+                    self._vc_prev_pixels = pv.detach()
+                    self._vc_prev_grid = batch['video_grid_thw'].detach()
+                    blind_pv = buf if (buf is not None and buf.shape == pv.shape
+                                       and torch.equal(grid, batch['video_grid_thw'])) else None
+                else:
+                    blind_pv = torch.zeros_like(pv)
+                if blind_pv is not None:
+                    blind_inputs = dict(batch)
+                    blind_inputs['pixel_values_videos'] = blind_pv
+                    if 'pixel_values' in blind_inputs:
+                        blind_inputs['pixel_values'] = torch.zeros_like(blind_inputs['pixel_values'])
+                    if self.vision_coupling_detach == 'blind':
+                        with torch.no_grad():
+                            blind_out = self.autovla(blind_inputs)
+                    else:
+                        blind_out = self.autovla(blind_inputs)
+                    kl = action_token_kl(output.logits, blind_out.logits, batch['labels'],
+                                         self.autovla.action_start_id, self.vision_coupling_detach)
+                    w = self.vision_coupling_weight
+                    if self.vision_coupling_warmup_steps > 0:
+                        w *= min(1.0, (self._vc_step + 1) / self.vision_coupling_warmup_steps)
+                    loss = loss + w * kl
+                    self.log('vision_coupling_kl', kl.item(),
+                             batch_size=gt_action.shape[0], sync_dist=True)
+                    self.log('vision_coupling_weight_eff', w,
+                             batch_size=gt_action.shape[0], sync_dist=True)
+                    if self._vc_step % 50 == 0:
+                        print(f"vision_coupling step {self._vc_step} ({self.vision_coupling_detach}/"
+                              f"{self.vision_coupling_blind}): kl={kl.item():.4f} nats")
 
         self.log("train_loss", loss.item(),
                  batch_size=gt_action.shape[0],
