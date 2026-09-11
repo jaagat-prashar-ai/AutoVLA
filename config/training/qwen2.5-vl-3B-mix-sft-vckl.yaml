@@ -1,0 +1,65 @@
+
+name: qwen2.5-vl-3B-mix-sft-vckl
+description: Continued SFT from the released AutoVLA checkpoint with camera-blind vision-coupling KL (weight 0.05)
+
+# model
+model:
+  use_cot: true
+  pretrained_model_path: ./AutoVLA-ckpt   # local snapshot of Zewei-Zhou/AutoVLA (LoRA-merged)
+  train_vision_backbone: false
+  train_lm_backbone: true
+  codebook_cache_path: "codebook_cache/agent_vocab.pkl"
+  trajectory: # future trajectory parameters
+    num_poses: 10
+    interval_length: 0.5
+    time_horizon: 5.0
+  tokens: # action token parameters, depends on the pretrained large model
+    action_start_id: 151665
+    ignore_index: -100
+    assistant_id: [151644, 77091]
+  video:
+    min_pixels: 109760
+    max_pixels: 109760
+
+# training
+training:
+  batch_size: 1
+  learning_rate: 2.0e-5
+  epochs: 5
+  num_workers: 4
+  weight_decay: 0.01
+  lr_warmup_step: 500
+  lr_step_frequency: 2000
+  lr_step_gamma: 0.98
+  train_sample_size: null  # Number of examples to randomly sample from training set, set to null to use full dataset
+  accumulate_grad_batches: 4
+  vision_coupling_weight: 0.05
+  vision_coupling_prob: 0.25
+  vision_coupling_blind: zero        # or "prev" (previous firing's frames)
+  vision_coupling_detach: blind      # KL(p_sighted || q_blind), blind fixed
+  vision_coupling_warmup_steps: 100
+
+data:
+  train:
+      json_dataset_path:
+        - ./dataset/nuplan/trainval
+        - ./dataset/nuscenes/nuscenes_train
+      sensor_data_path:
+        - ./dataset/nuplan/sensor_blobs/trainval
+        - null
+
+  val:
+      scene_filter: ./navsim/navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml
+      metric_cache_path: ./dataset/nuplan/navtest_metric_cache
+      json_dataset_path: ./dataset/nuplan/navtest
+      sensor_data_path: ./dataset/nuplan/sensor_blobs/test
+
+
+inference:
+  batch_size: 1
+  num_workers: 2
+  sample:
+    max_length: 2048
+    temperature: 0.01
+    top_k: 0
+    top_p: 1.0
